@@ -1,12 +1,66 @@
-from langchain_groq import ChatGroq
-from config import GROQ_API_KEY
 import json
 import re
+from groq import Groq
 
-llm = ChatGroq(
-    groq_api_key=GROQ_API_KEY,
-    model_name="llama3-70b-8192"
-)
+from config import GROQ_API_KEY
+
+
+def _get_groq_client() -> Groq:
+    """Create Groq client lazily so module import never fails on startup."""
+    if not GROQ_API_KEY:
+        raise ValueError(
+            "GROQ_API_KEY is missing. Set it in backend/.env or environment variables."
+        )
+    return Groq(api_key=GROQ_API_KEY)
+
+
+def _extract_json_array(raw_text: str) -> str:
+    """Extract the first balanced JSON array from model output."""
+    if not raw_text:
+        raise ValueError("Empty LLM response")
+
+    text = raw_text.strip()
+
+    # Handle markdown fenced output like ```json ... ```
+    fenced_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+    if fenced_match:
+        text = fenced_match.group(1).strip()
+
+    # Fast path: response already looks like a pure JSON array
+    if text.startswith("[") and text.endswith("]"):
+        return text
+
+    # Balanced bracket scan to avoid fragile non-greedy regex extraction.
+    start = text.find("[")
+    if start == -1:
+        raise ValueError("No JSON array start '[' found in LLM response")
+
+    depth = 0
+    in_string = False
+    escape = False
+
+    for idx in range(start, len(text)):
+        ch = text[idx]
+
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start:idx + 1]
+
+    raise ValueError("No balanced JSON array end ']' found in LLM response")
 
 def generate_mcqs(text, topic, num_questions):
     """
@@ -17,11 +71,17 @@ def generate_mcqs(text, topic, num_questions):
     From the following text, generate exactly {num_questions} multiple choice questions.
     Topic focus: {topic}
 
+    Make questions CONCEPTUAL and application-oriented:
+    1. Prefer "why/how" and scenario-based reasoning questions.
+    2. Avoid simple one-line factual recall unless absolutely necessary.
+    3. Include plausible distractors that test understanding, not memorization.
+    4. Keep language clear and exam-friendly.
+
     For each question, provide:
     1. A clear question text
     2. Exactly 4 options (A, B, C, D)
     3. The correct answer (one of the options)
-    4. A brief explanation of why the answer is correct
+    4. A short explanation of why the answer is correct
 
     Return ONLY a valid JSON array with no additional text. Use this exact format:
     [
@@ -39,16 +99,28 @@ def generate_mcqs(text, topic, num_questions):
     """
 
     try:
-        response = llm.invoke(prompt)
-        content = response.content.strip()
-        
-        # Try to extract JSON from the response
-        json_match = re.search(r'\[.*?\]', content, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(0)
-            mcqs = json.loads(json_str)
-        else:
-            mcqs = json.loads(content)
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You generate conceptual MCQs in strict JSON format only. "
+                        "Do not include any text outside JSON."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            temperature=0.2,
+        )
+        content = response.choices[0].message.content.strip()
+
+        json_str = _extract_json_array(content)
+        mcqs = json.loads(json_str)
         
         # Validate and ensure proper structure
         validated_mcqs = []

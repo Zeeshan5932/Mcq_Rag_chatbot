@@ -138,7 +138,12 @@ def _fetch_mcqs_from_api(
     num_questions: int,
     backend_url: str,
 ) -> List[Dict[str, Any]]:
-    """Call backend endpoint and return validated questions list."""
+    """Call backend endpoint and return validated questions list.
+
+    If backend API is not reachable, fallback to local generation so
+    Streamlit-only runs still work.
+    """
+    import io
     import requests
 
     files = {
@@ -150,24 +155,35 @@ def _fetch_mcqs_from_api(
     }
     data = {"topic": topic, "num_questions": num_questions}
 
-    response = requests.post(
-        f"{backend_url.rstrip('/')}/generate-mcqs/",
-        files=files,
-        data=data,
-        timeout=90,
-    )
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            f"{backend_url.rstrip('/')}/generate-mcqs/",
+            files=files,
+            data=data,
+            timeout=90,
+        )
+        response.raise_for_status()
 
-    payload = response.json()
-    if not payload.get("success"):
-        error_message = payload.get("error") or "Backend returned an unknown error"
-        raise ValueError(error_message)
+        payload = response.json()
+        if not payload.get("success"):
+            error_message = payload.get("error") or "Backend returned an unknown error"
+            raise ValueError(error_message)
 
-    questions = payload.get("questions", [])
-    if not _validate_questions(questions):
-        raise ValueError("Invalid backend response: expected questions with answer and explanation")
+        questions = payload.get("questions", [])
+        if not _validate_questions(questions):
+            raise ValueError("Invalid backend response: expected questions with answer and explanation")
 
-    return questions
+        return questions
+    except requests.exceptions.RequestException:
+        # Fallback path for single-process Streamlit usage when API server is down.
+        local_text = extract_text_from_pdf(io.BytesIO(uploaded_file.getvalue()))
+        if not local_text:
+            raise ValueError("Could not extract text from uploaded PDF in local fallback mode")
+
+        questions = generate_mcqs(local_text, topic, num_questions)
+        if not _validate_questions(questions):
+            raise ValueError("Local generation failed or returned invalid MCQ format")
+        return questions
 
 
 def run_streamlit_app() -> None:
@@ -207,6 +223,14 @@ def run_streamlit_app() -> None:
                 "Other",
             ],
         )
+        custom_topic = ""
+        if topic == "Other":
+            custom_topic = st.text_input(
+                "Enter custom topic",
+                placeholder="e.g. National Skill Competency Test",
+            )
+
+        effective_topic = custom_topic.strip() if topic == "Other" else topic
         num_questions = st.slider("Number of MCQs", min_value=2, max_value=25, value=5)
 
         generate_clicked = st.button("Generate MCQs", type="primary", use_container_width=True)
@@ -222,12 +246,14 @@ def run_streamlit_app() -> None:
     if generate_clicked:
         if uploaded_file is None:
             st.error("Please upload a PDF before generating questions.")
+        elif topic == "Other" and not effective_topic:
+            st.error("Please enter a custom topic when 'Other' is selected.")
         else:
             with st.spinner("Generating MCQs from backend API..."):
                 try:
                     questions = _fetch_mcqs_from_api(
                         uploaded_file=uploaded_file,
-                        topic=topic,
+                        topic=effective_topic,
                         num_questions=num_questions,
                         backend_url=backend_url,
                     )
@@ -239,6 +265,7 @@ def run_streamlit_app() -> None:
                         st.session_state.quiz_submitted = False
                         st.session_state.evaluation_results = []
                         st.success(f"Loaded {len(questions)} questions.")
+                        st.info("If API server is down, app uses local fallback automatically.")
                         st.rerun()
                 except Exception as exc:
                     st.error(f"Failed to generate MCQs: {exc}")
@@ -294,13 +321,14 @@ def run_streamlit_app() -> None:
         status_text = "Correct" if is_correct else "Wrong"
         status_color = "#eaf8ef" if is_correct else "#fbeaea"
         border_color = "#1f8f3a" if is_correct else "#c0392b"
+        status_badge = "#1f8f3a" if is_correct else "#c0392b"
 
         st.markdown(
             (
                 f"<div style='border-left:5px solid {border_color}; background:{status_color};"
-                " padding:12px; border-radius:8px; margin-bottom:10px;'>"
+                " padding:12px; border-radius:8px; margin-bottom:10px; color:#111111;'>"
                 f"<b>Q{idx}.</b> {result['question']}<br>"
-                f"<b>Status:</b> {status_text}<br>"
+                f"<b>Status:</b> <span style='color:{status_badge}; font-weight:700;'>{status_text}</span><br>"
                 f"<b>Your Answer:</b> {result['user_answer']}<br>"
                 f"<b>Correct Answer:</b> {result['correct_answer']}<br>"
                 f"<b>Explanation:</b> {result['explanation']}"
@@ -309,16 +337,41 @@ def run_streamlit_app() -> None:
             unsafe_allow_html=True,
         )
 
+        st.markdown("**Options**")
         option_index = 0
         for option in result["options"]:
             option_index += 1
             option_label = f"{option_index}. {option}"
             if option == result["correct_answer"]:
-                st.markdown(f":green[{option_label}]")
+                st.markdown(
+                    (
+                        "<div style='background:#eaf8ef; border:1px solid #1f8f3a;"
+                        " border-radius:6px; padding:8px; margin:6px 0; color:#111111;'>"
+                        f"<b>Correct:</b> {option_label}"
+                        "</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
             elif option == result["user_answer"] and not is_correct:
-                st.markdown(f":red[{option_label}]")
+                st.markdown(
+                    (
+                        "<div style='background:#fbeaea; border:1px solid #c0392b;"
+                        " border-radius:6px; padding:8px; margin:6px 0; color:#111111;'>"
+                        f"<b>Your Wrong Choice:</b> {option_label}"
+                        "</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
             else:
-                st.write(option_label)
+                st.markdown(
+                    (
+                        "<div style='background:#f6f8fa; border:1px solid #d0d7de;"
+                        " border-radius:6px; padding:8px; margin:6px 0; color:#111111;'>"
+                        f"{option_label}"
+                        "</div>"
+                    ),
+                    unsafe_allow_html=True,
+                )
 
         st.markdown("---")
 
